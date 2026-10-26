@@ -1,6 +1,6 @@
 # SeaORM GaussDB 适配（SeaORM 2.0.4 × Huawei GaussDB 507）
 
-基于 [SeaORM](https://github.com/SeaQL/sea-orm) 2.0.4 的华为 **GaussDB 507（集中式，Oracle 兼容模式 `DBCOMPATIBILITY = 'A'`）**适配版本。
+基于 [SeaORM](https://github.com/SeaQL/sea-orm) 2.0.4，适配华为 **GaussDB 507**（集中式部署，Oracle 兼容模式：建库参数 `DBCOMPATIBILITY = 'A'`，即 `sql_compatibility = A`）。
 全部方言行为经真库实测定档（GaussDB Kernel 507.0.0），测试矩阵 **701 用例全绿**（真库 16 + 存量回归 420 + 单测 265）。
 
 ## 仓库结构
