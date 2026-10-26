@@ -3,8 +3,6 @@
 基于 [SeaORM](https://github.com/SeaQL/sea-orm) 2.0.4 的华为 **GaussDB 507（集中式，Oracle 兼容模式 `DBCOMPATIBILITY = 'A'`）**适配版本。
 全部方言行为经真库实测定档（GaussDB Kernel 507.0.0），测试矩阵 **701 用例全绿**（真库 16 + 存量回归 420 + 单测 265）。
 
-对标社区适配先例：[huaweicloud-samples/database-hibernate-orm](https://github.com/huaweicloud-samples/database-hibernate-orm)（Hibernate 7.4.1 / GaussDB 方言）。
-
 ## 仓库结构
 
 ```
