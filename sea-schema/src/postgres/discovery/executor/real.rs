@@ -1,0 +1,49 @@
+use sea_query::{PostgresQueryBuilder, SelectStatement};
+use sea_query_sqlx::SqlxBinder;
+use sqlx::PgPool;
+
+use crate::{
+    Connection, debug_print,
+    sqlx_types::{SqlxError, SqlxRow},
+};
+
+pub struct Executor {
+    pool: PgPool,
+}
+
+pub trait IntoExecutor {
+    fn into_executor(self) -> Executor;
+}
+
+impl IntoExecutor for PgPool {
+    fn into_executor(self) -> Executor {
+        Executor { pool: self }
+    }
+}
+
+#[cfg_attr(feature = "sqlx-dep", async_trait::async_trait)]
+#[cfg_attr(not(feature = "sqlx-dep"), async_trait::async_trait(?Send))]
+impl Connection for Executor {
+    async fn query_all(&self, select: SelectStatement) -> Result<Vec<SqlxRow>, SqlxError> {
+        let (sql, values) = select.build_sqlx(PostgresQueryBuilder);
+        debug_print!("{}, {:?}", sql, values);
+
+        Ok(sqlx::query_with(sqlx::AssertSqlSafe(sql), values)
+            .fetch_all(&mut *self.pool.acquire().await?)
+            .await?
+            .into_iter()
+            .map(SqlxRow::Postgres)
+            .collect())
+    }
+
+    async fn query_all_raw(&self, sql: String) -> Result<Vec<SqlxRow>, SqlxError> {
+        debug_print!("{}", sql);
+
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(&mut *self.pool.acquire().await?)
+            .await?
+            .into_iter()
+            .map(SqlxRow::Postgres)
+            .collect())
+    }
+}

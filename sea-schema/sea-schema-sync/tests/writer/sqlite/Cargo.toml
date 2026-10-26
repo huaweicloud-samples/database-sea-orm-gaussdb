@@ -1,0 +1,10 @@
+[package]
+name = "sea-schema-sync-writer-test-sqlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+publish = false
+
+[dependencies]
+sea-schema-sync = { path = "../../../", features = [ "rusqlite", "discovery", "writer", "debug-print" ] }
+serde_json = { version = "1" }

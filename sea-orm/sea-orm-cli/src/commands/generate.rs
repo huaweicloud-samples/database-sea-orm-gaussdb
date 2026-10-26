@@ -1,0 +1,929 @@
+use crate::{BannerVersion, BigIntegerType, DateTimeCrate, GenerateSubcommands};
+use core::time;
+use sea_orm_codegen::{
+    BannerVersion as CodegenBannerVersion, BigIntegerType as CodegenBigIntegerType,
+    DateTimeCrate as CodegenDateTimeCrate, EntityFormat, EntityTransformer, EntityWriterContext,
+    MergeReport, OutputFile, WithPrelude, WithSerde, merge_entity_files,
+};
+use std::{error::Error, fs, path::Path, process::Command, str::FromStr};
+use tracing_subscriber::{EnvFilter, prelude::*};
+use url::Url;
+
+/// Split a string by comma while respecting parentheses nesting.
+/// This allows attributes like `test(a, b)` to be treated as a single value
+/// instead of being split into `test(a` and ` b)`.
+fn split_by_comma_ignoring_parentheses(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for c in s.chars() {
+        match c {
+            '(' => {
+                paren_depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(c);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(c);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(c);
+            }
+            '{' => {
+                brace_depth += 1;
+                current.push(c);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(c);
+            }
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    result.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Add the last segment
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        result.push(trimmed.to_string());
+    }
+
+    result
+}
+
+/// Process a vector of strings that may contain comma-separated values with nested parentheses.
+/// This handles the case where clap no longer splits by comma, so we need to manually split
+/// each string while respecting parentheses nesting.
+fn process_comma_separated_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(|s| split_by_comma_ignoring_parentheses(&s))
+        .collect()
+}
+
+/// Whether a discovered SQLite column is a generated (computed) column.
+///
+/// Generated columns cannot be inserted or updated, so they are dropped from
+/// generated entities — emitting them as ordinary fields makes every
+/// `INSERT`/`UPDATE` fail with "cannot INSERT/UPDATE a generated column" (#3094).
+#[cfg(feature = "sqlx-sqlite")]
+fn sqlite_column_is_generated(col: &sea_schema::sqlite::def::ColumnInfo) -> bool {
+    use sea_schema::sqlite::def::ColumnVisibility;
+    matches!(
+        col.hidden,
+        ColumnVisibility::GeneratedVirtual | ColumnVisibility::GeneratedStored
+    )
+}
+
+#[cfg(feature = "sqlx-postgres")]
+fn remove_postgres_partial_unique_indexes(table: &mut sea_schema::postgres::def::TableDef) {
+    table
+        .unique_constraints
+        .retain(|constraint| !constraint.is_partial);
+}
+
+/// The database name carried by a connection URL, or `None` if it has none.
+///
+/// The usual shape is hierarchical — `protocol://user:pass@host:port/database_name`
+/// — where the name is the first path segment. PostgreSQL also accepts the
+/// shorthand `postgres:database_name`, which has no authority component; the URL
+/// crate treats that as a "cannot-be-a-base" URL and yields no path segments at
+/// all, so the whole path is the database name (#2647).
+fn database_name_from_url(url: &Url) -> Option<&str> {
+    match url.path_segments() {
+        Some(mut segments) => segments.next(),
+        None => Some(url.path()),
+    }
+    .filter(|name| !name.is_empty())
+}
+
+pub async fn run_generate_command(
+    command: GenerateSubcommands,
+    verbose: bool,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        GenerateSubcommands::Entity {
+            entity_format,
+            compact_format: _,
+            expanded_format,
+            frontend_format,
+            include_hidden_tables,
+            tables,
+            ignore_tables,
+            max_connections,
+            acquire_timeout,
+            output_dir,
+            database_schema,
+            database_url,
+            with_prelude,
+            with_serde,
+            serde_skip_deserializing_primary_key,
+            serde_skip_hidden_column,
+            with_copy_enums,
+            date_time_crate,
+            big_integer_type,
+            lib,
+            model_extra_derives,
+            model_extra_attributes,
+            enum_extra_derives,
+            enum_extra_attributes,
+            column_extra_derives,
+            seaography,
+            impl_active_model_behavior,
+            preserve_user_modifications,
+            banner_version,
+            er_diagram,
+        } => {
+            if verbose {
+                let _ = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_test_writer()
+                    .try_init();
+            } else {
+                let filter_layer = EnvFilter::try_new("sea_orm_codegen=info").unwrap();
+                let fmt_layer = tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_level(false)
+                    .without_time();
+
+                let _ = tracing_subscriber::registry()
+                    .with(filter_layer)
+                    .with(fmt_layer)
+                    .try_init();
+            }
+
+            // The database should be a valid URL that can be parsed
+            // protocol://username:password@host/database_name
+            let url = Url::parse(&database_url)?;
+
+            // Make sure we have all the required url components
+            //
+            // Missing scheme will have been caught by the Url::parse() call
+            // above
+            let is_sqlite = url.scheme() == "sqlite";
+
+            // Closures for filtering tables
+            let filter_tables =
+                |table: &String| -> bool { tables.is_empty() || tables.contains(table) };
+
+            let filter_hidden_tables = |table: &str| -> bool {
+                if include_hidden_tables {
+                    true
+                } else {
+                    !table.starts_with('_')
+                }
+            };
+
+            let filter_skip_tables = |table: &String| -> bool { !ignore_tables.contains(table) };
+
+            let _database_name = if !is_sqlite {
+                // Throwing an error if there is no database name since it might be
+                // accepted by the database without it, while we're looking to dump
+                // information from a particular database
+                database_name_from_url(&url).unwrap_or_else(|| {
+                    panic!(
+                        "There is no database name as part of the url path: {}",
+                        url.as_str()
+                    )
+                })
+            } else {
+                Default::default()
+            };
+
+            let (schema_name, table_stmts) = match url.scheme() {
+                "mysql" => {
+                    #[cfg(not(feature = "sqlx-mysql"))]
+                    {
+                        panic!("mysql feature is off")
+                    }
+                    #[cfg(feature = "sqlx-mysql")]
+                    {
+                        use sea_schema::mysql::discovery::SchemaDiscovery;
+                        use sqlx::MySql;
+
+                        println!("Connecting to MySQL ...");
+                        let connection = sqlx_connect::<MySql>(
+                            max_connections,
+                            acquire_timeout,
+                            url.as_str(),
+                            None,
+                        )
+                        .await?;
+                        println!("Discovering schema ...");
+                        let schema_discovery = SchemaDiscovery::new(connection, _database_name);
+                        let schema = schema_discovery.discover().await?;
+                        let table_stmts = schema
+                            .tables
+                            .into_iter()
+                            .filter(|schema| filter_tables(&schema.info.name))
+                            .filter(|schema| filter_hidden_tables(&schema.info.name))
+                            .filter(|schema| filter_skip_tables(&schema.info.name))
+                            .map(|mut schema| {
+                                // Skip generated columns (see #3094).
+                                schema.columns.retain(|col| !col.extra.generated);
+                                schema.write()
+                            })
+                            .collect();
+                        (None, table_stmts)
+                    }
+                }
+                "sqlite" => {
+                    #[cfg(not(feature = "sqlx-sqlite"))]
+                    {
+                        panic!("sqlite feature is off")
+                    }
+                    #[cfg(feature = "sqlx-sqlite")]
+                    {
+                        use sea_schema::sqlite::discovery::SchemaDiscovery;
+                        use sqlx::Sqlite;
+
+                        println!("Connecting to SQLite ...");
+                        let connection = sqlx_connect::<Sqlite>(
+                            max_connections,
+                            acquire_timeout,
+                            url.as_str(),
+                            None,
+                        )
+                        .await?;
+                        println!("Discovering schema ...");
+                        let schema_discovery = SchemaDiscovery::new(connection);
+                        let schema = schema_discovery
+                            .discover()
+                            .await?
+                            .merge_indexes_into_table();
+                        let table_stmts = schema
+                            .tables
+                            .into_iter()
+                            .filter(|schema| filter_tables(&schema.name))
+                            .filter(|schema| filter_hidden_tables(&schema.name))
+                            .filter(|schema| filter_skip_tables(&schema.name))
+                            .map(|mut schema| {
+                                // Skip generated columns: codegen can't round-trip them, and
+                                // emitting them as ordinary fields makes INSERT/UPDATE fail
+                                // ("cannot INSERT/UPDATE a generated column"). See #3094.
+                                schema
+                                    .columns
+                                    .retain(|col| !sqlite_column_is_generated(col));
+                                schema.write()
+                            })
+                            .collect();
+                        (None, table_stmts)
+                    }
+                }
+                "postgres" | "postgresql" => {
+                    #[cfg(not(feature = "sqlx-postgres"))]
+                    {
+                        panic!("postgres feature is off")
+                    }
+                    #[cfg(feature = "sqlx-postgres")]
+                    {
+                        use sea_schema::postgres::discovery::SchemaDiscovery;
+                        use sqlx::Postgres;
+
+                        println!("Connecting to Postgres ...");
+                        let schema = database_schema.as_deref().unwrap_or("public");
+                        let connection = sqlx_connect::<Postgres>(
+                            max_connections,
+                            acquire_timeout,
+                            url.as_str(),
+                            Some(schema),
+                        )
+                        .await?;
+                        println!("Discovering schema ...");
+                        let schema_discovery = SchemaDiscovery::new(connection, schema);
+                        let schema = schema_discovery.discover().await?;
+                        let table_stmts = schema
+                            .tables
+                            .into_iter()
+                            .filter(|schema| filter_tables(&schema.info.name))
+                            .filter(|schema| filter_hidden_tables(&schema.info.name))
+                            .filter(|schema| filter_skip_tables(&schema.info.name))
+                            .map(|mut schema| {
+                                // Skip generated columns (see #3094).
+                                schema.columns.retain(|col| col.generated.is_none());
+                                // Remove them because we don't support partial unique indexes in codegen yet.
+                                remove_postgres_partial_unique_indexes(&mut schema);
+                                schema.write()
+                            })
+                            .collect();
+                        (database_schema, table_stmts)
+                    }
+                }
+                "gaussdb" => {
+                    #[cfg(not(feature = "gaussdb"))]
+                    {
+                        panic!("gaussdb feature is off")
+                    }
+                    #[cfg(feature = "gaussdb")]
+                    {
+                        use sea_schema::postgres::discovery::SchemaDiscovery;
+                        use sqlx::Postgres;
+
+                        println!("Connecting to GaussDB ...");
+                        let schema = database_schema.as_deref().unwrap_or("public");
+                        let connection = sqlx_connect::<Postgres>(
+                            max_connections,
+                            acquire_timeout,
+                            url.as_str(),
+                            Some(schema),
+                        )
+                        .await?;
+                        println!("Discovering schema ...");
+                        let schema_discovery = SchemaDiscovery::new(connection, schema);
+                        let schema = schema_discovery.discover().await?;
+                        let table_stmts = schema
+                            .tables
+                            .into_iter()
+                            .filter(|schema| filter_tables(&schema.info.name))
+                            .filter(|schema| filter_hidden_tables(&schema.info.name))
+                            .filter(|schema| filter_skip_tables(&schema.info.name))
+                            .map(|mut schema| {
+                                // Skip generated columns (see #3094).
+                                schema.columns.retain(|col| col.generated.is_none());
+                                // Remove them because we don't support partial unique indexes in codegen yet.
+                                remove_postgres_partial_unique_indexes(&mut schema);
+                                schema.write()
+                            })
+                            .collect();
+                        (database_schema, table_stmts)
+                    }
+                }
+                _ => unimplemented!("{} is not supported", url.scheme()),
+            };
+            println!("... discovered.");
+
+            // Process extra derives and attributes, splitting by comma while respecting parentheses
+            // This handles cases like `--model-extra-attributes 'cfg_attr(debug_assertions, derive(Debug))'`
+            // which should be treated as a single attribute, not split into `cfg_attr(debug_assertions` and ` derive(Debug))`
+            let model_extra_derives = process_comma_separated_values(model_extra_derives);
+            let model_extra_attributes = process_comma_separated_values(model_extra_attributes);
+            let enum_extra_derives = process_comma_separated_values(enum_extra_derives);
+            let enum_extra_attributes = process_comma_separated_values(enum_extra_attributes);
+            let column_extra_derives = process_comma_separated_values(column_extra_derives);
+
+            let writer_context = EntityWriterContext::new(
+                if expanded_format {
+                    EntityFormat::Expanded
+                } else if frontend_format {
+                    EntityFormat::Frontend
+                } else if let Some(entity_format) = entity_format {
+                    EntityFormat::from_str(&entity_format).expect("Invalid entity-format option")
+                } else {
+                    EntityFormat::default()
+                },
+                WithPrelude::from_str(&with_prelude).expect("Invalid prelude option"),
+                WithSerde::from_str(&with_serde).expect("Invalid serde derive option"),
+                with_copy_enums,
+                date_time_crate.into(),
+                big_integer_type.into(),
+                schema_name,
+                lib,
+                serde_skip_deserializing_primary_key,
+                serde_skip_hidden_column,
+                model_extra_derives,
+                model_extra_attributes,
+                enum_extra_derives,
+                enum_extra_attributes,
+                column_extra_derives,
+                seaography,
+                impl_active_model_behavior,
+                banner_version.into(),
+            );
+            let entity_writer = EntityTransformer::transform(table_stmts)?;
+
+            let dir = Path::new(&output_dir);
+            fs::create_dir_all(dir)?;
+
+            if er_diagram {
+                let diagram = entity_writer.generate_er_diagram();
+                let diagram_path = dir.join("entities.mermaid");
+                fs::write(&diagram_path, &diagram)?;
+                println!("Writing {}", diagram_path.display());
+            }
+
+            let output = entity_writer.generate(&writer_context);
+
+            let mut merge_fallback_files: Vec<String> = Vec::new();
+
+            for OutputFile { name, content } in output.files.iter() {
+                let file_path = dir.join(name);
+                println!("Writing {}", file_path.display());
+
+                if !matches!(
+                    name.as_str(),
+                    "mod.rs" | "lib.rs" | "prelude.rs" | "sea_orm_active_enums.rs"
+                ) && file_path.exists()
+                    && preserve_user_modifications
+                {
+                    let prev_content = fs::read_to_string(&file_path)?;
+                    match merge_entity_files(&prev_content, content) {
+                        Ok(merged) => {
+                            fs::write(file_path, merged)?;
+                        }
+                        Err(MergeReport {
+                            output,
+                            warnings,
+                            fallback_applied,
+                        }) => {
+                            for message in warnings {
+                                eprintln!("{message}");
+                            }
+                            fs::write(file_path, output)?;
+                            if fallback_applied {
+                                merge_fallback_files.push(name.clone());
+                            }
+                        }
+                    }
+                } else {
+                    fs::write(file_path, content)?;
+                };
+            }
+
+            // Format each of the files
+            for OutputFile { name, .. } in output.files.iter() {
+                let exit_status = Command::new("rustfmt").arg(dir.join(name)).status()?; // Get the status code
+                if !exit_status.success() {
+                    // Propagate the error if any
+                    return Err(format!("Fail to format file `{name}`").into());
+                }
+            }
+
+            if merge_fallback_files.is_empty() {
+                println!("... Done.");
+            } else {
+                return Err(format!(
+                    "Merge fallback applied for {} file(s): \n{}",
+                    merge_fallback_files.len(),
+                    merge_fallback_files.join("\n")
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn sqlx_connect<DB>(
+    max_connections: u32,
+    acquire_timeout: u64,
+    url: &str,
+    schema: Option<&str>,
+) -> Result<sqlx::Pool<DB>, Box<dyn Error>>
+where
+    DB: sqlx::Database,
+    for<'a> &'a mut <DB as sqlx::Database>::Connection: sqlx::Executor<'a>,
+{
+    let mut pool_options = sqlx::pool::PoolOptions::<DB>::new()
+        .max_connections(max_connections)
+        .acquire_timeout(time::Duration::from_secs(acquire_timeout));
+    // Set search_path for Postgres, E.g. Some("public") by default
+    // MySQL & SQLite connection initialize with schema `None`
+    if let Some(schema) = schema {
+        let sql = format!("SET search_path = '{schema}'");
+        pool_options = pool_options.after_connect(move |conn, _| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, sqlx::AssertSqlSafe(sql))
+                    .await
+                    .map(|_| ())
+            })
+        });
+    }
+    pool_options.connect(url).await.map_err(Into::into)
+}
+
+impl From<DateTimeCrate> for CodegenDateTimeCrate {
+    fn from(date_time_crate: DateTimeCrate) -> CodegenDateTimeCrate {
+        match date_time_crate {
+            DateTimeCrate::Chrono => CodegenDateTimeCrate::Chrono,
+            DateTimeCrate::Time => CodegenDateTimeCrate::Time,
+        }
+    }
+}
+
+impl From<BigIntegerType> for CodegenBigIntegerType {
+    fn from(date_time_crate: BigIntegerType) -> CodegenBigIntegerType {
+        match date_time_crate {
+            BigIntegerType::I64 => CodegenBigIntegerType::I64,
+            BigIntegerType::I32 => CodegenBigIntegerType::I32,
+        }
+    }
+}
+
+impl From<BannerVersion> for CodegenBannerVersion {
+    fn from(banner_version: BannerVersion) -> CodegenBannerVersion {
+        match banner_version {
+            BannerVersion::Off => CodegenBannerVersion::Off,
+            BannerVersion::Major => CodegenBannerVersion::Major,
+            BannerVersion::Minor => CodegenBannerVersion::Minor,
+            BannerVersion::Patch => CodegenBannerVersion::Patch,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::{Cli, Commands};
+
+    #[test]
+    fn test_database_name_from_url() {
+        let cases = [
+            // Shorthand with no authority component -- the case from #2647.
+            ("postgres:my_db", Some("my_db")),
+            ("postgresql:my_db", Some("my_db")),
+            // The usual hierarchical forms.
+            ("postgres://user:pass@localhost:5432/my_db", Some("my_db")),
+            ("postgres:///my_db", Some("my_db")),
+            ("mysql://root:root@localhost:3306/my_db", Some("my_db")),
+            // Only the first segment is the database name.
+            ("postgres://localhost/my_db/extra", Some("my_db")),
+            // No database name in any form.
+            ("postgresql://root:root@localhost:3306", None),
+            ("mysql://root:root@localhost:3306/", None),
+            ("postgres:", None),
+        ];
+
+        for (input, expected) in cases {
+            let url = Url::parse(input).unwrap_or_else(|e| panic!("could not parse {input}: {e}"));
+            assert_eq!(
+                database_name_from_url(&url),
+                expected,
+                "unexpected database name for {input}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "called `Result::unwrap()` on an `Err` value: RelativeUrlWithoutBase"
+    )]
+    fn test_generate_entity_no_protocol() {
+        let cli = Cli::parse_from([
+            "sea-orm-cli",
+            "generate",
+            "entity",
+            "--database-url",
+            "://root:root@localhost:3306/database",
+        ]);
+
+        match cli.command {
+            Commands::Generate { command } => {
+                smol::block_on(run_generate_command(command, cli.verbose)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "There is no database name as part of the url path: postgresql://root:root@localhost:3306"
+    )]
+    fn test_generate_entity_no_database_section() {
+        let cli = Cli::parse_from([
+            "sea-orm-cli",
+            "generate",
+            "entity",
+            "--database-url",
+            "postgresql://root:root@localhost:3306",
+        ]);
+
+        match cli.command {
+            Commands::Generate { command } => {
+                smol::block_on(run_generate_command(command, cli.verbose)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "There is no database name as part of the url path: mysql://root:root@localhost:3306/"
+    )]
+    fn test_generate_entity_no_database_path() {
+        let cli = Cli::parse_from([
+            "sea-orm-cli",
+            "generate",
+            "entity",
+            "--database-url",
+            "mysql://root:root@localhost:3306/",
+        ]);
+
+        match cli.command {
+            Commands::Generate { command } => {
+                smol::block_on(run_generate_command(command, cli.verbose)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "called `Result::unwrap()` on an `Err` value: EmptyHost")]
+    fn test_generate_entity_no_host() {
+        let cli = Cli::parse_from([
+            "sea-orm-cli",
+            "generate",
+            "entity",
+            "--database-url",
+            "postgres://root:root@/database",
+        ]);
+
+        match cli.command {
+            Commands::Generate { command } => {
+                smol::block_on(run_generate_command(command, cli.verbose)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_split_by_comma_simple() {
+        // Simple comma-separated values should split normally
+        let result = super::split_by_comma_ignoring_parentheses("a,b,c");
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_parentheses() {
+        // Comma inside parentheses should NOT split
+        let result = super::split_by_comma_ignoring_parentheses("test(a, b)");
+        assert_eq!(result, vec!["test(a, b)"]);
+
+        // Multiple values, one with parentheses containing comma
+        let result = super::split_by_comma_ignoring_parentheses("attr1,test(a, b)");
+        assert_eq!(result, vec!["attr1", "test(a, b)"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_nested_parentheses() {
+        // Nested parentheses with commas
+        let result =
+            super::split_by_comma_ignoring_parentheses("cfg_attr(debug_assertions, derive(Debug))");
+        assert_eq!(result, vec!["cfg_attr(debug_assertions, derive(Debug))"]);
+
+        // Multiple nested parentheses
+        let result = super::split_by_comma_ignoring_parentheses(
+            "cfg_attr(feature1, attr(a, b)),cfg_attr(feature2, attr(c, d))",
+        );
+        assert_eq!(
+            result,
+            vec![
+                "cfg_attr(feature1, attr(a, b))",
+                "cfg_attr(feature2, attr(c, d))"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_by_comma_with_brackets() {
+        // Brackets should also be respected
+        let result = super::split_by_comma_ignoring_parentheses(
+            "serde(rename_all = \"camelCase\"),ts(export)",
+        );
+        assert_eq!(
+            result,
+            vec!["serde(rename_all = \"camelCase\")", "ts(export)"]
+        );
+
+        // Brackets with commas
+        let result = super::split_by_comma_ignoring_parentheses("attr[key, value],other");
+        assert_eq!(result, vec!["attr[key, value]", "other"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_with_braces() {
+        // Braces should also be respected
+        let result = super::split_by_comma_ignoring_parentheses("derive{a, b},other");
+        assert_eq!(result, vec!["derive{a, b}", "other"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_empty() {
+        // Empty string should return empty vec
+        let result = super::split_by_comma_ignoring_parentheses("");
+        assert!(result.is_empty());
+
+        // Only whitespace should return empty vec
+        let result = super::split_by_comma_ignoring_parentheses("   ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_split_by_comma_whitespace_handling() {
+        // Whitespace around values should be trimmed
+        let result = super::split_by_comma_ignoring_parentheses("  a  ,  b  ");
+        assert_eq!(result, vec!["a", "b"]);
+
+        // Whitespace inside parentheses should be preserved
+        let result = super::split_by_comma_ignoring_parentheses("test( a , b )");
+        assert_eq!(result, vec!["test( a , b )"]);
+    }
+
+    #[test]
+    fn test_process_comma_separated_values() {
+        // Process multiple strings, each potentially containing comma-separated values
+        let input = vec![
+            "attr1,attr2".to_string(),
+            "test(a, b)".to_string(),
+            "attr3".to_string(),
+        ];
+        let result = super::process_comma_separated_values(input);
+        assert_eq!(result, vec!["attr1", "attr2", "test(a, b)", "attr3"]);
+    }
+
+    #[test]
+    fn test_split_by_comma_real_world_examples() {
+        // Real-world example: cfg_attr with derive
+        let result = super::split_by_comma_ignoring_parentheses(
+            "cfg_attr(debug_assertions, derive(Debug)),serde(rename_all = \"camelCase\")",
+        );
+        assert_eq!(
+            result,
+            vec![
+                "cfg_attr(debug_assertions, derive(Debug))",
+                "serde(rename_all = \"camelCase\")"
+            ]
+        );
+
+        // Real-world example: multiple derives
+        let result = super::split_by_comma_ignoring_parentheses(
+            "derive(Debug, Clone),derive(Serialize, Deserialize)",
+        );
+        assert_eq!(
+            result,
+            vec!["derive(Debug, Clone)", "derive(Serialize, Deserialize)"]
+        );
+    }
+
+    // Regression test for #3094: generated columns must be dropped during
+    // `generate entity`, otherwise they are emitted as ordinary writable fields
+    // and every INSERT/UPDATE fails ("cannot INSERT/UPDATE a generated column").
+    #[cfg(feature = "sqlx-sqlite")]
+    #[test]
+    fn test_generate_entity_skips_sqlite_generated_columns() {
+        use sea_schema::sea_query::ColumnType;
+        use sea_schema::sqlite::def::{ColumnInfo, ColumnVisibility, DefaultType, TableDef};
+
+        let col = |cid, name: &str, hidden| ColumnInfo {
+            cid,
+            name: name.to_owned(),
+            r#type: ColumnType::Integer,
+            not_null: true,
+            default_value: DefaultType::Unspecified,
+            primary_key: cid == 0,
+            hidden,
+        };
+
+        let mut table = TableDef {
+            name: "widget".to_owned(),
+            foreign_keys: vec![],
+            indexes: vec![],
+            constraints: vec![],
+            columns: vec![
+                col(0, "id", ColumnVisibility::Visible),
+                col(1, "w", ColumnVisibility::Visible),
+                col(2, "area", ColumnVisibility::GeneratedVirtual),
+                col(3, "area_stored", ColumnVisibility::GeneratedStored),
+            ],
+            auto_increment: false,
+        };
+
+        // The predicate flags only the generated columns.
+        assert!(!super::sqlite_column_is_generated(&table.columns[0]));
+        assert!(!super::sqlite_column_is_generated(&table.columns[1]));
+        assert!(super::sqlite_column_is_generated(&table.columns[2]));
+        assert!(super::sqlite_column_is_generated(&table.columns[3]));
+
+        // After filtering + write(), generated columns are absent from the DDL.
+        table
+            .columns
+            .retain(|col| !super::sqlite_column_is_generated(col));
+        let stmt = table.write();
+        let names: Vec<String> = stmt
+            .get_columns()
+            .iter()
+            .map(|c| c.get_column_name())
+            .collect();
+        assert_eq!(names, ["id", "w"]);
+    }
+
+    // Discovery-backed companion to the regression test above. The test above
+    // hand-builds `ColumnVisibility`, so it proves the filter but not that real
+    // `GENERATED ALWAYS AS (...)` DDL actually surfaces as `Generated*` from
+    // `PRAGMA table_xinfo`. This exercises the discovery -> filter contract end
+    // to end against an in-memory SQLite database, which is the whole premise of
+    // the #3094 fix.
+    #[cfg(all(feature = "sqlx-sqlite", feature = "tokio"))]
+    #[tokio::test]
+    async fn test_sqlite_discovery_reports_generated_columns() {
+        use sea_schema::sqlite::discovery::SchemaDiscovery;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        // `sqlite::memory:` gives each connection its own private database, so
+        // pin the pool to a single connection or CREATE TABLE and discovery
+        // would run against different in-memory databases.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+
+        sqlx::query(
+            "CREATE TABLE widget ( \
+                 id INTEGER PRIMARY KEY, \
+                 w INTEGER NOT NULL, \
+                 h INTEGER NOT NULL, \
+                 area_virtual INTEGER GENERATED ALWAYS AS (w * h) VIRTUAL, \
+                 area_stored INTEGER GENERATED ALWAYS AS (w * h) STORED \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let schema = SchemaDiscovery::new(pool)
+            .discover()
+            .await
+            .expect("discover schema");
+
+        let table = schema
+            .tables
+            .iter()
+            .find(|table| table.name == "widget")
+            .expect("widget table discovered");
+
+        // Real generated DDL is discovered as `Generated*` visibility — the
+        // fact the hand-built unit test has to assume.
+        let generated: Vec<&str> = table
+            .columns
+            .iter()
+            .filter(|col| super::sqlite_column_is_generated(col))
+            .map(|col| col.name.as_str())
+            .collect();
+        assert_eq!(generated, ["area_virtual", "area_stored"]);
+
+        // After the retain performed by `generate entity`, only the base
+        // (writable) columns survive.
+        let kept: Vec<&str> = table
+            .columns
+            .iter()
+            .filter(|col| !super::sqlite_column_is_generated(col))
+            .map(|col| col.name.as_str())
+            .collect();
+        assert_eq!(kept, ["id", "w", "h"]);
+    }
+
+    #[cfg(feature = "sqlx-postgres")]
+    #[test]
+    fn filter_out_postgres_partial_unique_indexes() {
+        use sea_schema::postgres::def::{TableDef, TableInfo, Unique};
+
+        let unique_constraint = Unique {
+            name: "login_email_key".to_owned(),
+            columns: vec!["email".to_owned()],
+            is_partial: false,
+        };
+        let partial_constraint = Unique {
+            name: "login_human_login_id_key".to_owned(),
+            columns: vec!["human_login_id".to_owned()],
+            is_partial: true,
+        };
+        let mut table = TableDef {
+            info: TableInfo {
+                name: "login".to_owned(),
+                of_type: None,
+            },
+            columns: vec![],
+            check_constraints: vec![],
+            not_null_constraints: vec![],
+            unique_constraints: vec![unique_constraint.clone(), partial_constraint],
+            primary_key_constraints: vec![],
+            reference_constraints: vec![],
+            exclusion_constraints: vec![],
+        };
+
+        super::remove_postgres_partial_unique_indexes(&mut table);
+
+        assert_eq!(table.unique_constraints.len(), 1);
+        assert_eq!(table.unique_constraints[0], unique_constraint);
+    }
+}

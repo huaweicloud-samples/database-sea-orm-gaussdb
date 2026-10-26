@@ -1,0 +1,21 @@
+[package]
+name = "sqlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+sea-schema-sync = { path = "../../../", features = [
+    "discovery",
+    "writer",
+    "debug-print",
+    "parser",
+    "rusqlite",
+    "sqlite",
+] }
+serde_json = { version = "1" }
+pretty_assertions = { version = "0.7" }
+env_logger = { version = "0" }
+log = { version = "0" }

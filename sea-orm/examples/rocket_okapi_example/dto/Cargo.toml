@@ -1,0 +1,19 @@
+[package]
+edition      = "2024"
+name         = "dto"
+publish      = false
+rust-version = "1.85.0"
+version      = "0.1.0"
+
+[lib]
+name = "dto"
+path = "src/lib.rs"
+
+[dependencies]
+rocket = { version = "0.5", features = ["json"] }
+
+[dependencies.entity]
+path = "../entity"
+
+[dependencies.rocket_okapi]
+version = "0.9"

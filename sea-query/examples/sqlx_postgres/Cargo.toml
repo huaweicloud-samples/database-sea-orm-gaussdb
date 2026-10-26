@@ -1,0 +1,34 @@
+[workspace]
+# A separate workspace
+
+[package]
+name = "sea-query-sqlx-postgres-example"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+publish = false
+
+[dependencies]
+time = { version = "0.3.36", features = ["macros"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+serde_json = { version = "1" }
+async-std = { version = "1.8", features = [ "attributes" ] }
+sqlx = "0.9"
+sea-query = { path = "../../" }
+sea-query-sqlx = { path = "../../sea-query-sqlx", features = [
+    "sqlx-postgres",
+    "with-chrono",
+    "with-json",
+    "with-rust_decimal",
+    "with-bigdecimal",
+    "with-uuid",
+    "with-time",
+    "with-ipnetwork",
+    "with-mac_address",
+    "runtime-async-std",
+    "tls-native-tls",
+] }
+
+# NOTE: if you are copying this example into your own project, use the following line instead:
+# sea-query = { version = "1.0" }
+# sea-query-sqlx = { version = "0", features = [...] }

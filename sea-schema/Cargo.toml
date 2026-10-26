@@ -1,0 +1,129 @@
+[workspace]
+members = [
+    ".",
+    "tests/discovery/mysql",
+    "tests/discovery/postgres",
+    "tests/discovery/sqlite",
+    "tests/writer/mysql",
+    "tests/writer/postgres",
+    "tests/writer/sqlite",
+    "tests/live/mysql",
+    "tests/live/postgres",
+    "tests/live/sqlite",
+    "tests/partially_unique_index",
+]
+
+[package]
+name = "sea-schema"
+version = "0.18.1"
+authors = [ "Chris Tsang <tyt2y7@gmail.com>" ]
+edition = "2024"
+description = "🌿 SQL schema definition and discovery"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/sea-schema"
+repository = "https://github.com/SeaQL/sea-schema"
+categories = ["database"]
+keywords = ["database", "sql", "mysql", "postgres"]
+rust-version = "1.85.0"
+
+[package.metadata.docs.rs]
+features = ["default"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "sea_schema"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { version = "0.1", default-features = false }
+sea-schema-derive = { version = "0.3.0", path = "sea-schema-derive", default-features = false }
+sea-query = { version = "1.0.0", default-features = false, features = ["derive"] }
+sea-query-sqlx = { version = "0.9.0", default-features = false, optional = true }
+serde = { version = "1", default-features = false, optional = true, features = ["derive"] }
+sqlx = { version = "0.9.0", default-features = false, optional = true }
+log = { version = "0.4", default-features = false, optional = true }
+
+[features]
+default = ["mysql", "postgres", "sqlite", "discovery", "writer", "probe"]
+debug-print = ["log"]
+mysql = ["sea-query/backend-mysql"]
+postgres = ["sea-query/backend-postgres"]
+postgres-vector = ["sea-query/postgres-vector", "sea-query-sqlx/postgres-vector"]
+sqlite = ["sea-query/backend-sqlite"]
+def = []
+discovery = ["parser"]
+parser = ["query"]
+query = ["def"]
+writer = ["def"]
+planetscale = []
+sync = []
+probe = ["query"]
+sqlx-dep = ["sqlx"]
+sqlx-all = ["sqlx-mysql", "sqlx-postgres", "sqlx-sqlite"]
+sqlx-mysql = [
+    "mysql",
+    "sqlx-dep",
+    "sea-query-sqlx/sqlx-mysql",
+    "sqlx/mysql",
+]
+sqlx-postgres = [
+    "postgres",
+    "sqlx-dep",
+    "sea-query-sqlx/sqlx-postgres",
+    "sqlx/postgres",
+]
+sqlx-sqlite = [
+    "sqlite",
+    "sqlx-dep",
+    "sea-query-sqlx/sqlx-sqlite",
+    "sqlx/sqlite",
+]
+runtime-actix = [
+    "sqlx?/runtime-tokio",
+    "sea-query-sqlx?/runtime-actix",
+]
+runtime-async-std = [
+    "sqlx?/runtime-async-std",
+    "sea-query-sqlx?/runtime-async-std",
+]
+runtime-tokio = [
+    "sqlx?/runtime-tokio",
+    "sea-query-sqlx?/runtime-tokio",
+]
+runtime-actix-native-tls = [
+    "sqlx?/runtime-tokio",
+    "sqlx?/tls-native-tls",
+    "sea-query-sqlx?/runtime-actix-native-tls",
+]
+runtime-async-std-native-tls = [
+    "sqlx?/runtime-async-std",
+    "sqlx?/tls-native-tls",
+    "sea-query-sqlx?/runtime-async-std-native-tls",
+]
+runtime-tokio-native-tls = [
+    "sqlx?/runtime-tokio",
+    "sqlx?/tls-native-tls",
+    "sea-query-sqlx?/runtime-tokio-native-tls",
+]
+runtime-actix-rustls = [
+    "sqlx?/runtime-tokio",
+    "sqlx?/tls-rustls",
+    "sea-query-sqlx?/runtime-actix-rustls",
+]
+runtime-async-std-rustls = [
+    "sqlx?/runtime-async-std",
+    "sqlx?/tls-rustls",
+    "sea-query-sqlx?/runtime-async-std-rustls",
+]
+runtime-tokio-rustls = [
+    "sqlx?/runtime-tokio",
+    "sqlx?/tls-rustls",
+    "sea-query-sqlx?/runtime-tokio-rustls",
+]
+rusqlite = []
+with-serde = ["serde"]
+
+# This allows us to develop using a local version of sea-query
+[patch.crates-io]
+# sea-query = { path = "../sea-query" }
+# sea-query = { git = "https://github.com/SeaQL/sea-query", branch = "master" }

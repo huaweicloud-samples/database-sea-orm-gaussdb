@@ -1,0 +1,26 @@
+[package]
+edition      = "2024"
+name         = "graphql"
+publish      = false
+rust-version = "1.85.0"
+version      = "0.1.0"
+
+[dependencies]
+async-graphql = { version = "5.0.6", features = [
+    "decimal",
+    "chrono",
+    "dataloader",
+    "dynamic-schema",
+] }
+async-graphql-poem = { version = "5.0.6" }
+async-trait = { version = "0.1.64" }
+dotenv = "0.15.0"
+lazy_static = { version = "1.4.0" }
+poem = { version = "1.3.55" }
+tokio = { version = "1.26.0", features = ["macros", "rt-multi-thread"] }
+tracing = { version = "0.1.37" }
+tracing-subscriber = { version = "0.3.16" }
+
+entity     = { path = "../entity", features = ["seaography"] }
+sea-orm    = { path = "../../../" }
+seaography = { path = "../../../../seaography" }

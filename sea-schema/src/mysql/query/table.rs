@@ -1,0 +1,129 @@
+use super::{CharacterSetFields, InformationSchema, SchemaQueryBuilder};
+use crate::sqlx_types::SqlxRow;
+use sea_query::{Condition, DynIden, Expr, ExprTrait, Iden, Order, Query, SelectStatement};
+
+const MARIADB_FULL_COLLATION_NAME_SINCE: u32 = 101001;
+
+#[derive(Debug, Clone, Copy, sea_query::Iden)]
+/// Refs:
+/// - https://dev.mysql.com/doc/refman/8.0/en/information-schema-tables-table.html
+/// - https://mariadb.com/docs/server/reference/system-tables/information-schema/information-schema-tables
+pub enum TablesFields {
+    TableCatalog,
+    TableSchema,
+    TableName,
+    TableType,
+    Engine,
+    Version,
+    RowFormat,
+    TableRows,
+    AvgRowLength,
+    DataLength,
+    MaxDataLength,
+    IndexLength,
+    DataFree,
+    AutoIncrement,
+    CreateTime,
+    UpdateTime,
+    CheckTime,
+    TableCollation,
+    Checksum,
+    CreateOptions,
+    TableComment,
+}
+
+#[derive(Debug, sea_query::Iden)]
+pub enum TableType {
+    #[iden = "BASE TABLE"]
+    BaseTable,
+    #[iden = "VIEW"]
+    View,
+    #[iden = "SYSTEM VIEW"]
+    SystemView,
+    #[iden = "SYSTEM VERSIONED"]
+    SystemVersioned,
+}
+
+#[derive(Debug, Default)]
+pub struct TableQueryResult {
+    pub table_name: String,
+    pub engine: String,
+    pub auto_increment: Option<u64>,
+    pub table_char_set: Option<String>,
+    pub table_collation: Option<String>,
+    pub table_comment: String,
+    pub create_options: String,
+}
+
+impl SchemaQueryBuilder {
+    pub fn query_tables(&self, schema: DynIden) -> SelectStatement {
+        type Schema = InformationSchema;
+        let is_mariadb_and_ge_10_10_01 =
+            self.system.is_maria_db() && self.system.version >= MARIADB_FULL_COLLATION_NAME_SINCE;
+
+        Query::select()
+            .columns(vec![
+                TablesFields::TableName,
+                TablesFields::Engine,
+                TablesFields::AutoIncrement,
+                TablesFields::TableCollation,
+                TablesFields::TableComment,
+                TablesFields::CreateOptions,
+            ])
+            .column((
+                Schema::CollationCharacterSet,
+                CharacterSetFields::CharacterSetName,
+            ))
+            .from((Schema::Schema, Schema::Tables))
+            .left_join((Schema::Schema, Schema::CollationCharacterSet), {
+                let info_tables_collation = (Schema::Tables, TablesFields::TableCollation);
+                Condition::any()
+                    .add_option(is_mariadb_and_ge_10_10_01.then(|| {
+                        Expr::col((
+                            Schema::CollationCharacterSet,
+                            CharacterSetFields::FullCollationName,
+                        ))
+                        .equals(info_tables_collation)
+                    }))
+                    .add(
+                        Expr::col((
+                            Schema::CollationCharacterSet,
+                            CharacterSetFields::CollationName,
+                        ))
+                        .equals(info_tables_collation),
+                    )
+            })
+            .and_where(Expr::col(TablesFields::TableSchema).eq(schema.to_string()))
+            .and_where(Expr::col(TablesFields::TableType).is_in([
+                TableType::BaseTable.to_string(),
+                TableType::SystemVersioned.to_string(),
+            ]))
+            .order_by(TablesFields::TableName, Order::Asc)
+            .take()
+    }
+}
+
+#[cfg(feature = "sqlx-mysql")]
+impl From<SqlxRow> for TableQueryResult {
+    fn from(row: SqlxRow) -> Self {
+        use crate::mysql::discovery::GetMySqlValue;
+        use crate::sqlx_types::Row;
+        let row = row.mysql();
+        Self {
+            table_name: row.get_string(0),
+            engine: row.get_string(1),
+            auto_increment: row.get(2),
+            table_collation: row.get_string_opt(3),
+            table_comment: row.get_string(4),
+            create_options: row.get_string(5),
+            table_char_set: row.get_string_opt(6),
+        }
+    }
+}
+
+#[cfg(not(feature = "sqlx-mysql"))]
+impl From<SqlxRow> for TableQueryResult {
+    fn from(_: SqlxRow) -> Self {
+        Self::default()
+    }
+}

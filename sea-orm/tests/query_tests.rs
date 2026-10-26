@@ -1,0 +1,366 @@
+#![allow(unused_imports, dead_code)]
+
+pub mod common {
+    #[cfg(not(feature = "sync"))]
+    pub mod runtime;
+    pub mod setup;
+    pub use setup::TestContext;
+    pub mod bakery_chain;
+    pub mod bakery_dense;
+}
+
+pub use common::{TestContext, bakery_chain::*, bakery_dense, setup::*};
+pub use sea_orm::entity::*;
+pub use sea_orm::{ConnectionTrait, QueryFilter, QuerySelect};
+
+// Run the test locally:
+// DATABASE_URL="mysql://root:@localhost" cargo test --features sqlx-mysql,runtime-async-std --test query_tests
+#[sea_orm_macros::test]
+pub async fn find_one_with_no_result() {
+    let ctx = TestContext::new("find_one_with_no_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let bakery = Bakery::find().one(&ctx.db).await.unwrap();
+    assert_eq!(bakery, None);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_one_with_result() {
+    let ctx = TestContext::new("find_one_with_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let bakery = bakery::ActiveModel {
+        name: Set("SeaSide Bakery".to_owned()),
+        profit_margin: Set(10.4),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let result = Bakery::find().one(&ctx.db).await.unwrap().unwrap();
+
+    assert_eq!(result.id, bakery.id.unwrap());
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_by_id_with_no_result() {
+    let ctx = TestContext::new("find_by_id_with_no_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let bakery = Bakery::find_by_id(999).one(&ctx.db).await.unwrap();
+    assert_eq!(bakery, None);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_by_id_with_result() {
+    let ctx = TestContext::new("find_by_id_with_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let bakery = bakery::ActiveModel {
+        name: Set("SeaSide Bakery".to_owned()),
+        profit_margin: Set(10.4),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let result = Bakery::find_by_id(bakery.id.clone().unwrap())
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.id, bakery.id.unwrap());
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_all_with_no_result() {
+    let ctx = TestContext::new("find_all_with_no_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let bakeries = Bakery::find().all(&ctx.db).await.unwrap();
+    assert_eq!(bakeries.len(), 0);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_all_with_result() {
+    let ctx = TestContext::new("find_all_with_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let _ = bakery::ActiveModel {
+        name: Set("SeaSide Bakery".to_owned()),
+        profit_margin: Set(10.4),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let _ = bakery::ActiveModel {
+        name: Set("Top Bakery".to_owned()),
+        profit_margin: Set(15.0),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let bakeries = Bakery::find().all(&ctx.db).await.unwrap();
+
+    assert_eq!(bakeries.len(), 2);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_all_filter_no_result() {
+    let ctx = TestContext::new("find_all_filter_no_result").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let _ = bakery::ActiveModel {
+        name: Set("SeaSide Bakery".to_owned()),
+        profit_margin: Set(10.4),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let _ = bakery::ActiveModel {
+        name: Set("Top Bakery".to_owned()),
+        profit_margin: Set(15.0),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let bakeries = Bakery::find()
+        .filter(bakery::Column::Name.contains("Good"))
+        .all(&ctx.db)
+        .await
+        .unwrap();
+
+    assert_eq!(bakeries.len(), 0);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn find_all_filter_with_results() {
+    let ctx = TestContext::new("find_all_filter_with_results").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+
+    let _ = bakery::ActiveModel {
+        name: Set("SeaSide Bakery".to_owned()),
+        profit_margin: Set(10.4),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let _ = bakery::ActiveModel {
+        name: Set("Top Bakery".to_owned()),
+        profit_margin: Set(15.0),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let bakeries = Bakery::find()
+        .filter(bakery::Column::Name.contains("Bakery"))
+        .all(&ctx.db)
+        .await
+        .unwrap();
+
+    assert_eq!(bakeries.len(), 2);
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn select_only_exclude_option_fields() {
+    let ctx = TestContext::new("select_only_exclude_option_fields").await;
+    create_customer_table(&ctx.db).await.unwrap();
+
+    let _ = customer::ActiveModel {
+        name: Set("Alice".to_owned()),
+        notes: Set(Some("Want to communicate with Bob".to_owned())),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert customer");
+
+    let _ = customer::ActiveModel {
+        name: Set("Bob".to_owned()),
+        notes: Set(Some("Just listening".to_owned())),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert customer");
+
+    let _ = customer::ActiveModel {
+        name: Set("Sam".to_owned()),
+        notes: Set(None),
+        ..Default::default()
+    }
+    .insert(&ctx.db)
+    .await
+    .expect("could not insert customer");
+
+    let customers = Customer::find()
+        .select_only()
+        .column(customer::Column::Id)
+        .column(customer::Column::Name)
+        .all(&ctx.db)
+        .await
+        .unwrap();
+
+    assert_eq!(customers.len(), 3);
+    assert_eq!(customers[0].notes, None);
+    assert_eq!(customers[1].notes, None);
+    assert_eq!(customers[2].notes, None);
+
+    let sam = bakery_dense::customer::Entity::find()
+        .filter(bakery_dense::customer::COLUMN.name.eq("Sam"))
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let _: sea_orm::StringColumnNullable<bakery_dense::customer::Entity> =
+        bakery_dense::customer::COLUMN.notes;
+
+    assert_eq!(
+        sam,
+        bakery_dense::customer::Entity::find()
+            .filter(
+                bakery_dense::customer::COLUMN
+                    .notes
+                    .eq(Option::<String>::None)
+            )
+            .one(&ctx.db)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn select_except_excludes_option_fields() {
+    let ctx = TestContext::new("select_except_excludes_option_fields").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+    create_baker_table(&ctx.db).await.unwrap();
+
+    let bakery = bakery::ActiveModel {
+        name: Set("Sweet Treats".to_owned()),
+        profit_margin: Set(0.5),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let _ = baker::ActiveModel {
+        name: Set("Alice".to_owned()),
+        contact_details: Set(serde_json::json!({
+            "phone": "555-1234",
+            "email": "alice@example.com"
+        })),
+        bakery_id: Set(Some(bakery.id.clone().unwrap())),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert baker");
+
+    let bakers = Baker::find()
+        .select_except([baker::Column::BakeryId])
+        .all(&ctx.db)
+        .await
+        .unwrap();
+
+    assert_eq!(bakers.len(), 1);
+    assert_eq!(bakers[0].name, "Alice");
+    assert_eq!(
+        bakers[0].contact_details,
+        serde_json::json!({
+            "phone": "555-1234",
+            "email": "alice@example.com"
+        })
+    );
+    assert_eq!(bakers[0].bakery_id, None);
+
+    let bakery_id: Option<i32> = Baker::find_by_id(bakers[0].id)
+        .select_only()
+        .column(baker::Column::BakeryId)
+        .into_tuple()
+        .one(&ctx.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(bakery_id, Some(bakery.id.unwrap()));
+
+    ctx.delete().await;
+}
+
+#[sea_orm_macros::test]
+pub async fn select_except_non_nullable_column_fails() {
+    let ctx = TestContext::new("select_except_non_nullable_column_fails").await;
+    create_bakery_table(&ctx.db).await.unwrap();
+    create_baker_table(&ctx.db).await.unwrap();
+
+    let bakery = bakery::ActiveModel {
+        name: Set("Sweet Treats".to_owned()),
+        profit_margin: Set(0.5),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert bakery");
+
+    let _ = baker::ActiveModel {
+        name: Set("Alice".to_owned()),
+        contact_details: Set(serde_json::json!({
+            "phone": "555-1234",
+            "email": "alice@example.com"
+        })),
+        bakery_id: Set(Some(bakery.id.clone().unwrap())),
+        ..Default::default()
+    }
+    .save(&ctx.db)
+    .await
+    .expect("could not insert baker");
+
+    let err = Baker::find()
+        .select_except([baker::Column::Name])
+        .all(&ctx.db)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        sea_orm::DbErr::Type(msg) if msg == "Missing value for column 'name'"
+    ));
+
+    ctx.delete().await;
+}
