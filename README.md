@@ -36,7 +36,7 @@
 - 方言透传：upsert 渲染（A 模式 `ON DUPLICATE KEY UPDATE`）、能力门（LATERAL / 聚合 FILTER 显式拒绝）
 - 主键回填：A 模式 `RETURNING` identity 列报告为 NUMERIC 的解码兜底
 - Oracle 类型通道：`number` / `varchar2` / `clob` / `blob` / `raw`（hex）/ `datea` 引导
-- 向量能力：`FloatVector` 类型 + `$1::floatvector` cast 绑定 + ANN 查询 + GSIVFFLAT 索引
+- 向量能力：`FloatVector` / `BoolVector` 类型 + `$1::floatvector` cast 绑定 + ANN 查询 + 距离查询 helper（`order_by_l2_distance` 等）+ `DeriveValueType` 一等实体字段（`save_as = "floatvector"`）+ GSIVFFLAT/GSDISKANN 索引 API
 - schema-sync / codegen / CLI：`generate entity` 端到端（identity 主键正确推断 i32）
 - 迁移：sea-orm-migration `gaussdb` feature + journey
 
