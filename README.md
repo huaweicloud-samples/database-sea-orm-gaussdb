@@ -1,7 +1,7 @@
 # SeaORM GaussDB 适配（SeaORM 2.0.4 × Huawei GaussDB 507）
 
 基于 [SeaORM](https://github.com/SeaQL/sea-orm) 2.0.4，适配华为 **GaussDB 507**（集中式部署，Oracle 兼容模式：建库参数 `DBCOMPATIBILITY = 'A'`，即 `sql_compatibility = A`）。
-全部方言行为经真库实测定档（GaussDB Kernel 507.0.0），测试矩阵 **701 用例全绿**（真库 16 + 存量回归 420 + 单测 265）。
+全部方言行为经真库实测定档（GaussDB Kernel 507.0.0），测试矩阵 **770+ 用例全绿**（真库 23 + 存量回归 420 + lib 单测 273 + 组合矩阵/doctest/fork 单测）。
 
 ## 仓库结构
 
@@ -85,13 +85,13 @@ let db = Database::connect("gaussdb://user:password@host:5432/dbname").await?;
 cd sea-orm
 $env:GAUSSDB_PASSWORD='<password>'
 cargo test -p sea-orm --features gaussdb,schema-sync,runtime-tokio-native-tls `
-  --test gaussdb_smoke --test gaussdb_types --test gaussdb_schema_sync --test gaussdb_vector
+  --test gaussdb_smoke --test gaussdb_types --test gaussdb_schema_sync --test gaussdb_vector --test gaussdb_journey
 
 cd sea-orm-migration
 cargo test -p sea-orm-migration --features gaussdb,runtime-tokio-native-tls --test gaussdb_migration
 ```
 
-运行命令、用例清单与验证矩阵详见 **`sea-orm/docs/gaussdb-testing.md`**；存量回归 420/420、lib 单测 266/266（上游 Postgres/MySQL/SQLite 零回归）。
+运行命令、用例清单与验证矩阵详见 **`sea-orm/docs/gaussdb-testing.md`**；存量回归 420/420、lib 单测 273/273（上游 Postgres/MySQL/SQLite 零回归）。
 
 ## 已知限制
 
