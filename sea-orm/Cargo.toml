@@ -248,6 +248,6 @@ with-uuid = ["uuid", "sea-query/with-uuid", "sea-query-sqlx?/with-uuid"]
 
 # This allows us to develop using a local version of sea-query
 [patch.crates-io]
-sea-query = { path = "../sea-query" }
-sea-query-sqlx = { path = "../sea-query/sea-query-sqlx" }
+sea-query = { path = "../sea-query-1.0.2" }
+sea-query-sqlx = { path = "../sea-query-1.0.2/sea-query-sqlx" }
 sea-schema = { path = "../sea-schema" }

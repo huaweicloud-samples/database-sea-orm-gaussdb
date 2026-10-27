@@ -151,6 +151,6 @@ strip         = true
 # (`sea-schema` points at the local fork carrying the GaussDB discovery fixes:
 # LATERAL-free index query and `attidentity` identity-column discovery)
 [patch.crates-io]
-sea-query = { path = "../../sea-query" }
-sea-query-sqlx = { path = "../../sea-query/sea-query-sqlx" }
+sea-query = { path = "../../sea-query-1.0.2" }
+sea-query-sqlx = { path = "../../sea-query-1.0.2/sea-query-sqlx" }
 sea-schema = { path = "../../sea-schema" }

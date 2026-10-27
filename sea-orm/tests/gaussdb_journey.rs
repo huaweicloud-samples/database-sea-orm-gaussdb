@@ -1,0 +1,940 @@
+//! GaussDB A 模式真库 journey 测试（T-journey）——补齐已适配但缺真库用例的
+//! 七条能力：事务 commit/rollback（含 savepoint 探针）、分页、关系 join、
+//! load().with() 嵌套加载、stream、update_many、CTE WITH RECURSIVE。
+//!
+//! 与 `gaussdb_smoke.rs` 同构：`--features gaussdb` 编译，仅当
+//! `GAUSSDB_PASSWORD` 设置时触碰真库；缺失则逐用例打印 skip 并成功退出。
+//! 由 controller 对本地探针库执行：
+//! `gaussdb://appuser:<GAUSSDB_PASSWORD>@localhost:5432/seaorm_survey`。
+//!
+//! 用例与覆盖点索引：
+//! 1. `transaction_commit_rollback` —— `db.begin()` / `commit()` / `rollback()`
+//!    （src/database/transaction.rs `InnerConnection::GaussDB` 分支复用
+//!    `<sqlx::Postgres>::TransactionManager`）；另含嵌套 savepoint 探针
+//!    （`DatabaseTransaction::begin()` => SAVEPOINT，A 模式未定档 → try 结构，
+//!    失败只打印定档结果不 fail）。
+//! 2. `paginator_pages` —— `PaginatorTrait::paginate`（src/executor/paginator.rs），
+//!    LIMIT/OFFSET + COUNT(*) 子查询。
+//! 3. `relations_find_linked` —— `find_also_related`（src/query/join.rs），
+//!    实体形态照抄 `src/tests_cfg/fruit.rs`（compact_model + 手写 Relation + Related）。
+//! 4. `nested_load_with_relation` —— SeaORM 2.0 `Entity::load().with()`
+//!    （sea-orm-macros 生成 EntityLoader，见 sea-orm-macros/src/derives/entity_loader.rs；
+//!    用法参照 tests/active_model_ex_tests.rs / tests/entity_loader_tests.rs）。
+//! 5. `stream_fetch_100_rows` —— `Entity::find().stream()`（src/executor/select.rs，
+//!    `#[cfg(feature = "stream")]`；stream 逐条消费用 `futures_util::StreamExt::next`，
+//!    sea-orm 内部 `try_next` 仅为 sync-feature 测试 shim 非公共 API）。
+//!    未启用 stream feature 时打印 skip。
+//! 6. `update_many_bulk` —— `Entity::update_many().col_expr(..).filter(..)` +
+//!    `exec()` / `exec_with_returning()`（src/executor/update.rs；1.x
+//!    `update_many_with_result` 的 `was_already_updated` 在 2.0.4 无此 API，
+//!    语义以 rows_affected 重复执行定档替代）。
+//! 7. `cte_with_recursive_count` —— sea-query fork（1.0.2）`WithClause` /
+//!    `CommonTableExpression` 构造 `WITH RECURSIVE`；`WithQuery` 实现了 sea-orm
+//!    `StatementBuilder`（src/database/statement.rs `build_query_stmt!`），可直接
+//!    `db.query_all(&with_query)`，GaussDB 走 PostgresQueryBuilder。方言定档：
+//!    tasks/todo.md「WITH RECURSIVE 可用」。
+//!
+//! 定档出处缩写：
+//! - [T7] = probe/verification-results.md §三/T7（A 模式 IDENTITY 附属序列
+//!   `{table}_{col}_identity` 不随 DROP TABLE 级联删除 → 清理须补 DROP SEQUENCE）
+//! - [T4] = 同文件 §六[3]（identity 主键 RETURNING 报 NUMERIC，整数 TryGetable
+//!   已带 NUMERIC 兜底解码 → i64/i32 直读可用）
+
+#![cfg(feature = "gaussdb")]
+
+use sea_orm::sea_query::{Alias, CommonTableExpression, Expr, Order, Query, UnionType, WithClause};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DbBackend, DbErr, EntityTrait,
+    ExprTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+};
+
+/// 连接守卫：取 GAUSSDB_PASSWORD；缺失则打印 skip 提示并返回 None（不 panic）。
+fn gaussdb_password() -> Option<String> {
+    match std::env::var("GAUSSDB_PASSWORD") {
+        Ok(pwd) => Some(pwd),
+        Err(_) => {
+            eprintln!("skipped: GAUSSDB_PASSWORD not set");
+            None
+        }
+    }
+}
+
+/// 探针库连接 URL（本地 5432，库 seaorm_survey，用户 appuser）。
+fn gaussdb_url(pwd: &str) -> String {
+    format!("gaussdb://appuser:{pwd}@localhost:5432/seaorm_survey")
+}
+
+/// 幂等清理：DROP TABLE + 补 DROP IDENTITY 附属序列。
+/// [T7] A 模式 DROP TABLE 不级联 `{table}_{col}_identity`，残留序列会让下次
+/// 建表报 42P07，故成对清理（每用例开头防残留 + 结尾用后即删都走这里）。
+async fn drop_jrn_table(db: &sea_orm::DatabaseConnection, table: &str) -> Result<(), DbErr> {
+    db.execute_unprepared(&format!("DROP TABLE IF EXISTS {table}"))
+        .await
+        .map(|_| ())?;
+    db.execute_unprepared(&format!("DROP SEQUENCE IF EXISTS {table}_id_identity"))
+        .await
+        .map(|_| ())
+}
+
+/// COUNT(*) 整数解码（i64，走 [T4] 已实锤的整数通道）。
+/// 泛型接受连接或事务（两者都实现 ConnectionTrait）。
+/// 条件子句为用例内常量字符串，无注入面。
+async fn count_where<C: ConnectionTrait>(conn: &C, table: &str, cond: &str) -> Result<i64, DbErr> {
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            DbBackend::GaussDB,
+            format!("SELECT COUNT(*) FROM {table} WHERE {cond}"),
+        ))
+        .await?;
+    match rows.first() {
+        Some(row) => row.try_get_by_index::<i64>(0).map_err(DbErr::from),
+        None => Err(DbErr::RecordNotFound("COUNT(*) must return a row".into())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 用例 1：事务 commit / rollback + 嵌套 savepoint 探针
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_commit_rollback() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    const TABLE: &str = "seaorm_jrn_txn";
+    // 幂等起点（[T7] 补 DROP SEQUENCE）
+    drop_jrn_table(&db, TABLE)
+        .await
+        .expect("drop leftover seaorm_jrn_txn");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {TABLE} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         name varchar(50))"
+    ))
+    .await
+    .expect("create seaorm_jrn_txn");
+
+    let body = async {
+        // ---- commit 段：事务内插两行，commit 后外层可见 ----
+        // 覆盖点：src/database/transaction.rs `InnerConnection::GaussDB` 分支
+        // 复用 <sqlx::Postgres>::TransactionManager::begin（BEGIN/COMMIT 报文）。
+        let txn = db.begin().await.expect("begin txn (commit leg)");
+        txn.execute_unprepared(&format!("INSERT INTO {TABLE} (name) VALUES ('t-one')"))
+            .await
+            .expect("insert t-one in txn");
+        txn.execute_unprepared(&format!("INSERT INTO {TABLE} (name) VALUES ('t-two')"))
+            .await
+            .expect("insert t-two in txn");
+        // 提交前事务内自见
+        assert_eq!(
+            count_where(&txn, TABLE, "1=1").await.expect("in-txn count"),
+            2,
+            "rows must be visible inside the uncommitted transaction"
+        );
+        txn.commit().await.expect("commit");
+
+        assert_eq!(
+            count_where(&db, TABLE, "1=1")
+                .await
+                .expect("post-commit count"),
+            2,
+            "committed rows must be visible on the outer connection"
+        );
+        assert_eq!(
+            count_where(&db, TABLE, "name IN ('t-one', 't-two')")
+                .await
+                .expect("post-commit name filter"),
+            2
+        );
+
+        // ---- rollback 段：事务内插第三行，rollback 后不落地 ----
+        let txn = db.begin().await.expect("begin txn (rollback leg)");
+        txn.execute_unprepared(&format!("INSERT INTO {TABLE} (name) VALUES ('t-three')"))
+            .await
+            .expect("insert t-three in txn");
+        assert_eq!(
+            count_where(&txn, TABLE, "name = 't-three'")
+                .await
+                .expect("pre-rollback in-txn count"),
+            1,
+            "rolled-back row must be visible inside its own transaction first"
+        );
+        txn.rollback().await.expect("rollback");
+        assert_eq!(
+            count_where(&db, TABLE, "name = 't-three'")
+                .await
+                .expect("post-rollback count"),
+            0,
+            "rolled-back row must not be visible after ROLLBACK"
+        );
+
+        // ---- 嵌套 savepoint 探针（独立事务，失败不 fail 主用例）----
+        // A 模式 savepoint 支持未定档：DatabaseTransaction::begin() 在 sqlx
+        // Postgres 事务管理器下应发 SAVEPOINT / ROLLBACK TO SAVEPOINT，但
+        // GaussDB A 模式（opfusion 关闭后经标准执行器）是否全链路放行未知。
+        // 成功 → 断言部分回滚语义；失败 → 打印定档结果（controller 落档）。
+        let probe = async {
+            let txn = db.begin().await?;
+            txn.execute_unprepared(&format!("INSERT INTO {TABLE} (name) VALUES ('sp-base')"))
+                .await?;
+            let sp = txn.begin().await?; // => SAVEPOINT
+            sp.execute_unprepared(&format!("INSERT INTO {TABLE} (name) VALUES ('sp-inner')"))
+                .await?;
+            let inner = count_where(&sp, TABLE, "name = 'sp-inner'").await?;
+            assert_eq!(inner, 1, "sp-inner must be visible inside the savepoint");
+            sp.rollback().await?; // => ROLLBACK TO SAVEPOINT
+            let after = count_where(&txn, TABLE, "name = 'sp-inner'").await?;
+            assert_eq!(
+                after, 0,
+                "sp-inner must be undone by savepoint rollback (partial rollback semantics)"
+            );
+            let base = count_where(&txn, TABLE, "name = 'sp-base'").await?;
+            assert_eq!(base, 1, "sp-base must survive the inner savepoint rollback");
+            txn.commit().await?;
+            Ok::<(), DbErr>(())
+        }
+        .await;
+        match probe {
+            Ok(()) => eprintln!(
+                "savepoint probe: OK — nested DatabaseTransaction::begin() acts as SAVEPOINT \
+                 with correct partial-rollback semantics (sp-inner undone, sp-base kept); \
+                 定档：A 模式 savepoint 支持"
+            ),
+            Err(e) => eprintln!(
+                "savepoint probe: FAILED — 定档结果供 controller 记录（A 模式 savepoint 未支持 \
+                 或语义有偏差）: {e}"
+            ),
+        }
+        // sp-base 是否落地取决于探针是否走到 commit —— 探针失败时不做外层断言，仅打印。
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    let dropped = drop_jrn_table(&db, TABLE).await;
+    body.expect("transaction_commit_rollback body");
+    dropped.expect("drop seaorm_jrn_txn");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 2：分页 paginate
+// ---------------------------------------------------------------------------
+
+mod jrn_pager {
+    use sea_orm::entity::prelude::*;
+
+    // 无关系实体，采用 src/tests_cfg/vendor.rs 的展开形态（手写空 Relation）。
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_pager")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn paginator_pages() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    const TABLE: &str = "seaorm_jrn_pager";
+    drop_jrn_table(&db, TABLE)
+        .await
+        .expect("drop leftover seaorm_jrn_pager");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {TABLE} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         name varchar(50))"
+    ))
+    .await
+    .expect("create seaorm_jrn_pager");
+
+    let body = async {
+        // 插 25 行；identity 主键回填走 [T4] 已实锤的 RETURNING 通道
+        let mut ids = Vec::new();
+        for i in 0..25 {
+            let m = jrn_pager::ActiveModel {
+                name: Set(format!("row-{i:02}")),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+            ids.push(m.id);
+        }
+
+        // 覆盖点：PaginatorTrait::paginate（src/executor/paginator.rs）——
+        // num_items 用 COUNT(*) AS num_items 子查询（i64 → u64），fetch_page
+        // 用 LIMIT/OFFSET；GaussDB 语句构建走 PostgresQueryBuilder。
+        // 加 ORDER BY 保证页内容确定性（paginator.rs LINT 注释要求）。
+        let paginator = jrn_pager::Entity::find()
+            .order_by_asc(jrn_pager::Column::Id)
+            .paginate(&db, 10);
+
+        assert_eq!(
+            paginator.num_items().await.expect("num_items"),
+            25,
+            "num_items must count all 25 rows"
+        );
+        assert_eq!(
+            paginator.num_pages().await.expect("num_pages"),
+            3,
+            "25 rows / 10 per page = 3 pages"
+        );
+
+        let p0 = paginator.fetch_page(0).await.expect("fetch_page(0)");
+        let p1 = paginator.fetch_page(1).await.expect("fetch_page(1)");
+        let p2 = paginator.fetch_page(2).await.expect("fetch_page(2)");
+        assert_eq!(p0.len(), 10, "page 0 has 10 rows");
+        assert_eq!(p1.len(), 10, "page 1 has 10 rows");
+        assert_eq!(p2.len(), 5, "page 2 has the remaining 5 rows");
+
+        // 页内容有序、不重叠、并起来恰为全部 25 行
+        let names: Vec<String> = p0
+            .iter()
+            .chain(p1.iter())
+            .chain(p2.iter())
+            .map(|m| m.name.clone())
+            .collect();
+        let expected: Vec<String> = (0..25).map(|i| format!("row-{i:02}")).collect();
+        assert_eq!(
+            names, expected,
+            "pages must be ordered, disjoint and complete"
+        );
+
+        // identity 回填的 id 与 name 序号一致（id 单调分配）
+        let page_ids: Vec<i32> = p0
+            .iter()
+            .chain(p1.iter())
+            .chain(p2.iter())
+            .map(|m| m.id)
+            .collect();
+        let mut sorted_ids = ids;
+        sorted_ids.sort();
+        assert_eq!(page_ids, sorted_ids);
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    let dropped = drop_jrn_table(&db, TABLE).await;
+    body.expect("paginator_pages body");
+    dropped.expect("drop seaorm_jrn_pager");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 3：关系 find_also_related
+// ---------------------------------------------------------------------------
+
+mod jrn_cake {
+    use sea_orm::entity::prelude::*;
+
+    #[sea_orm::compact_model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_cake")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub name: String,
+    }
+
+    // compact_model / DeriveEntityModel 展开引用 Relation 类型，无关系也须定义
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+mod jrn_fruit {
+    use sea_orm::entity::prelude::*;
+
+    #[sea_orm::compact_model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_fruit")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub name: String,
+        pub cake_id: Option<i32>,
+    }
+
+    // 实体形态照抄 src/tests_cfg/fruit.rs：compact_model + 手写 Relation + Related
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::jrn_cake::Entity",
+            from = "Column::CakeId",
+            to = "super::jrn_cake::Column::Id"
+        )]
+        Cake,
+    }
+
+    impl Related<super::jrn_cake::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Cake.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn relations_find_linked() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    const CAKE: &str = "seaorm_jrn_cake";
+    const FRUIT: &str = "seaorm_jrn_fruit";
+    drop_jrn_table(&db, FRUIT)
+        .await
+        .expect("drop leftover seaorm_jrn_fruit");
+    drop_jrn_table(&db, CAKE)
+        .await
+        .expect("drop leftover seaorm_jrn_cake");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {CAKE} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         name varchar(50))"
+    ))
+    .await
+    .expect("create seaorm_jrn_cake");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {FRUIT} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         name varchar(50), cake_id int REFERENCES {CAKE}(id))"
+    ))
+    .await
+    .expect("create seaorm_jrn_fruit");
+
+    let body = async {
+        let cheese = jrn_cake::ActiveModel {
+            name: Set("cheese".to_owned()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await?;
+        let strawberry = jrn_cake::ActiveModel {
+            name: Set("strawberry".to_owned()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await?;
+
+        for (fruit_name, cake_id) in [
+            ("apple", Some(cheese.id)),
+            ("banana", Some(cheese.id)),
+            ("cherry", Some(strawberry.id)),
+        ] {
+            jrn_fruit::ActiveModel {
+                name: Set(fruit_name.to_owned()),
+                cake_id: Set(cake_id),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+
+        // 覆盖点：find_also_related（src/query/join.rs）——LEFT JOIN +
+        // select_also，E: Related<R>（fruit belongs_to cake）。
+        // join 列名/表名限定由 GaussDB 方言（PostgresQueryBuilder）加引号渲染。
+        let rows = jrn_fruit::Entity::find()
+            .order_by_asc(jrn_fruit::Column::Id)
+            .find_also_related(jrn_cake::Entity)
+            .all(&db)
+            .await
+            .expect("find_also_related");
+
+        assert_eq!(rows.len(), 3, "each fruit joins exactly one row");
+        let paired: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|(f, c)| (f.name.as_str(), c.as_ref().map(|ck| ck.name.as_str())))
+            .collect();
+        assert_eq!(
+            paired,
+            vec![
+                ("apple", Some("cheese")),
+                ("banana", Some("cheese")),
+                ("cherry", Some("strawberry")),
+            ],
+            "belongs_to join must resolve the correct cake per fruit"
+        );
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    // 先删带外键的子表再删主表
+    let dropped = async {
+        drop_jrn_table(&db, FRUIT).await?;
+        drop_jrn_table(&db, CAKE).await?;
+        Ok::<(), DbErr>(())
+    }
+    .await;
+    body.expect("relations_find_linked body");
+    dropped.expect("drop seaorm_jrn_fruit / seaorm_jrn_cake");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 4：load().with() 嵌套加载
+// ---------------------------------------------------------------------------
+
+mod jrn_post {
+    use sea_orm::entity::prelude::*;
+
+    // SeaORM 2.0 model 形态（关系字段内联；宏生成 EntityLoader / ModelEx），
+    // 参照 tests/common/bakery_dense/cake.rs 与 src/tests_cfg/cake.rs。
+    #[sea_orm::model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_post")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub title: String,
+        #[sea_orm(has_many)]
+        pub comments: HasMany<super::jrn_comment::Entity>,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+mod jrn_comment {
+    use sea_orm::entity::prelude::*;
+
+    #[sea_orm::model]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_comment")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub post_id: i32,
+        pub body: String,
+        #[sea_orm(belongs_to, from = "post_id", to = "id")]
+        pub post: BelongsTo<super::jrn_post::Entity>,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn nested_load_with_relation() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    const POST: &str = "seaorm_jrn_post";
+    const COMMENT: &str = "seaorm_jrn_comment";
+    drop_jrn_table(&db, COMMENT)
+        .await
+        .expect("drop leftover seaorm_jrn_comment");
+    drop_jrn_table(&db, POST)
+        .await
+        .expect("drop leftover seaorm_jrn_post");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {POST} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         title varchar(80))"
+    ))
+    .await
+    .expect("create seaorm_jrn_post");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {COMMENT} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         post_id int NOT NULL REFERENCES {POST}(id), body varchar(120))"
+    ))
+    .await
+    .expect("create seaorm_jrn_comment");
+
+    let body = async {
+        let root = jrn_post::ActiveModel {
+            title: Set("root-post".to_owned()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await?;
+        let _lonely = jrn_post::ActiveModel {
+            title: Set("lonely-post".to_owned()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await?;
+
+        for text in ["first", "second"] {
+            jrn_comment::ActiveModel {
+                post_id: Set(root.id),
+                body: Set(text.to_owned()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+
+        // 覆盖点：SeaORM 2.0 `Entity::load().with()`（宏生成 EntityLoader，
+        // sea-orm-macros/src/derives/entity_loader.rs；load_many 批量二次查询）。
+        // 形态参照 tests/entity_loader_tests.rs `Cake::load().with(Bakery)`。
+        use sea_orm::compound::{EntityLoaderTrait, HasMany};
+
+        let posts = jrn_post::Entity::load()
+            .order_by_id_asc()
+            .with(jrn_comment::Entity)
+            .all(&db)
+            .await
+            .expect("load().with(comments)");
+
+        assert_eq!(posts.len(), 2, "two posts");
+        let p1 = &posts[0];
+        assert_eq!(p1.title, "root-post");
+        assert!(
+            p1.comments.is_loaded(),
+            "has_many relation must be loaded after .with()"
+        );
+        let HasMany::Loaded(comments) = &p1.comments else {
+            panic!("comments must be HasMany::Loaded after .with()");
+        };
+        assert_eq!(comments.len(), 2, "root-post has two comments");
+        let mut bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec!["first", "second"],
+            "loaded comment bodies must match seeded rows"
+        );
+
+        let p2 = &posts[1];
+        assert_eq!(p2.title, "lonely-post");
+        assert!(
+            p2.comments.is_loaded() && p2.comments.is_empty(),
+            "post without children must load to an empty (not unloaded) has_many"
+        );
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    let dropped = async {
+        drop_jrn_table(&db, COMMENT).await?;
+        drop_jrn_table(&db, POST).await?;
+        Ok::<(), DbErr>(())
+    }
+    .await;
+    body.expect("nested_load_with_relation body");
+    dropped.expect("drop seaorm_jrn_comment / seaorm_jrn_post");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 5：stream 逐条消费
+// ---------------------------------------------------------------------------
+
+mod jrn_stream {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_stream")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn stream_fetch_100_rows() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    #[cfg(feature = "stream")]
+    {
+        const TABLE: &str = "seaorm_jrn_stream";
+        drop_jrn_table(&db, TABLE)
+            .await
+            .expect("drop leftover seaorm_jrn_stream");
+        db.execute_unprepared(&format!(
+            "CREATE TABLE {TABLE} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+             name varchar(50))"
+        ))
+        .await
+        .expect("create seaorm_jrn_stream");
+
+        let body = async {
+            // 插 100 行：单条多值 INSERT（插入方式不影响被测读链路，
+            // 且避开 identity 回填的 100 次逐行往返）
+            let values: Vec<String> = (0..100).map(|i| format!("('s-{i:03}')")).collect();
+            db.execute_unprepared(&format!(
+                "INSERT INTO {TABLE} (name) VALUES {}",
+                values.join(", ")
+            ))
+            .await
+            .expect("bulk insert 100 rows");
+
+            // 覆盖点：Entity::find().stream()（src/executor/select.rs，
+            // #[cfg(feature = "stream")]；驱动侧 sqlx_gaussdb.rs stream => QueryStream）。
+            // 逐条消费用 futures_util::StreamExt::next（sea-orm 的 try_next
+            // 仅为 sync-feature 内部测试 shim，非公共 API）。
+            use futures_util::StreamExt;
+
+            let mut stream = jrn_stream::Entity::find()
+                .order_by_asc(jrn_stream::Column::Id)
+                .stream(&db)
+                .await
+                .expect("create row stream");
+
+            let mut ids = Vec::new();
+            while let Some(row) = stream.next().await {
+                ids.push(row?.id);
+            }
+            drop(stream);
+
+            assert_eq!(ids.len(), 100, "stream must yield all 100 rows");
+            let mut unique = ids.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                100,
+                "streamed ids must be unique (no duplicate rows)"
+            );
+            assert_eq!(ids, unique, "stream must preserve ORDER BY id asc order");
+
+            Ok::<(), DbErr>(())
+        }
+        .await;
+
+        let dropped = drop_jrn_table(&db, TABLE).await;
+        body.expect("stream_fetch_100_rows body");
+        dropped.expect("drop seaorm_jrn_stream");
+    }
+
+    #[cfg(not(feature = "stream"))]
+    eprintln!(
+        "skipped: sea-orm `stream` feature not enabled \
+         (本用例需 --features gaussdb,runtime-tokio-native-tls,stream)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 用例 6：update_many 批量更新
+// ---------------------------------------------------------------------------
+
+mod jrn_updm {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "seaorm_jrn_updm")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i32,
+        pub name: String,
+        // is_active 语义列：用 int(0/1) 而非 bool —— [probe §二] 仅有
+        // boolvector 拒 NULL 的定档，普通 boolean 列在 A 模式未定档，保守取整数通道
+        pub is_active: i32,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn update_many_bulk() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    const TABLE: &str = "seaorm_jrn_updm";
+    drop_jrn_table(&db, TABLE)
+        .await
+        .expect("drop leftover seaorm_jrn_updm");
+    db.execute_unprepared(&format!(
+        "CREATE TABLE {TABLE} (id int GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+         name varchar(50), is_active int)"
+    ))
+    .await
+    .expect("create seaorm_jrn_updm");
+
+    let body = async {
+        // 3 行 stale（is_active=0）+ 2 行 fresh（is_active=1）
+        for i in 0..3 {
+            jrn_updm::ActiveModel {
+                name: Set(format!("stale-{i}")),
+                is_active: Set(0),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+        for i in 0..2 {
+            jrn_updm::ActiveModel {
+                name: Set(format!("fresh-{i}")),
+                is_active: Set(1),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+
+        // 覆盖点：Entity::update_many()（src/entity/base_entity.rs =>
+        // Update::many，src/executor/update.rs Updater）—— 单条 UPDATE
+        // SET 多列 + WHERE。1.x `update_many_with_result`（TryUpdateStatus
+        // 的 is_active/was_already_updated）在 2.0.4 已不存在，按 2.0 形态
+        // 以 rows_affected 断言 + 回读替代（见下方重复执行定档）。
+        let res = jrn_updm::Entity::update_many()
+            .col_expr(jrn_updm::Column::Name, Expr::value("revived".to_owned()))
+            .col_expr(jrn_updm::Column::IsActive, Expr::value(1i32))
+            .filter(jrn_updm::Column::Name.like("stale%"))
+            .exec(&db)
+            .await
+            .expect("update_many exec");
+        assert_eq!(res.rows_affected, 3, "3 stale rows must be updated");
+
+        // was_already_updated 语义定档：重复执行同一 UPDATE，GaussDB（PG 语义）
+        // [T-journey 定档 2026-10-27] A-mode UPDATE rows_affected 走 **changed 语义**
+        // （同 MySQL：值未变的行不计——第二次执行同语句实测返回 0），非标准 PG 的
+        // matched 语义。重复执行钉住该差异。
+        let res2 = jrn_updm::Entity::update_many()
+            .col_expr(jrn_updm::Column::Name, Expr::value("revived".to_owned()))
+            .col_expr(jrn_updm::Column::IsActive, Expr::value(1i32))
+            .filter(jrn_updm::Column::Name.like("stale%"))
+            .exec(&db)
+            .await
+            .expect("update_many exec (second pass)");
+        assert_eq!(
+            res2.rows_affected, 0,
+            "A-mode UPDATE rows_affected is changed-semantics (values already \
+             identical -> 0 rows counted); document divergence from PG matched-semantics"
+        );
+
+        // exec_with_returning：support_returning() == true（[T4] 定档），
+        // UPDATE .. RETURNING 直接拿回被更新行
+        let flipped = jrn_updm::Entity::update_many()
+            .col_expr(jrn_updm::Column::IsActive, Expr::value(0i32))
+            .filter(jrn_updm::Column::Name.like("fresh%"))
+            .exec_with_returning(&db)
+            .await
+            .expect("update_many exec_with_returning");
+        assert_eq!(flipped.len(), 2, "RETURNING must bring back 2 rows");
+        assert!(
+            flipped
+                .iter()
+                .all(|m| m.name.starts_with("fresh") && m.is_active == 0),
+            "returned models must reflect the new is_active = 0"
+        );
+
+        // 全表回读：revived 行保持 is_active=1，fresh 行已翻转为 0
+        let all = jrn_updm::Entity::find()
+            .order_by_asc(jrn_updm::Column::Id)
+            .all(&db)
+            .await
+            .expect("read back all rows");
+        assert_eq!(all.len(), 5);
+        let revived: Vec<&jrn_updm::Model> = all.iter().filter(|m| m.name == "revived").collect();
+        assert_eq!(revived.len(), 3);
+        assert!(
+            revived.iter().all(|m| m.is_active == 1),
+            "revived rows must keep is_active = 1"
+        );
+        let fresh: Vec<&jrn_updm::Model> =
+            all.iter().filter(|m| m.name.starts_with("fresh")).collect();
+        assert_eq!(fresh.len(), 2);
+        assert!(fresh.iter().all(|m| m.is_active == 0));
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    let dropped = drop_jrn_table(&db, TABLE).await;
+    body.expect("update_many_bulk body");
+    dropped.expect("drop seaorm_jrn_updm");
+}
+
+// ---------------------------------------------------------------------------
+// 用例 7：CTE WITH RECURSIVE
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cte_with_recursive_count() {
+    let Some(pwd) = gaussdb_password() else {
+        return;
+    };
+    let db = Database::connect(gaussdb_url(&pwd))
+        .await
+        .expect("connect gaussdb://");
+
+    let body = async {
+        // 覆盖点：sea-query fork（../sea-query-1.0.2）WithClause +
+        // CommonTableExpression 递归 CTE；WithQuery 实现了 sea-orm
+        // StatementBuilder（src/database/statement.rs `build_query_stmt!(WithQuery)`），
+        // 直接 db.query_all(&with_query)，GaussDB 用 PostgresQueryBuilder 渲染。
+        // 方言定档：tasks/todo.md「WITH RECURSIVE 可用」。
+        //
+        // 目标 SQL：
+        //   WITH RECURSIVE jrn_seq (n) AS (
+        //     SELECT 1 UNION ALL SELECT jrn_seq.n + 1 FROM jrn_seq WHERE jrn_seq.n < 10
+        //   ) SELECT n FROM jrn_seq ORDER BY n ASC
+        // 锚点用字面量 1（SELECT $1 在 PG 侧无法推断参数类型，故不走 Expr::value）。
+        let mut cte_body = Query::select().expr(Expr::cust("1")).take();
+        let recurse = Query::select()
+            .expr(Expr::col((Alias::new("jrn_seq"), Alias::new("n"))).add(1))
+            .from(Alias::new("jrn_seq"))
+            .and_where(Expr::col((Alias::new("jrn_seq"), Alias::new("n"))).lt(10i32))
+            .take();
+        cte_body.union(UnionType::All, recurse);
+
+        let mut cte = CommonTableExpression::new();
+        cte.table_name(Alias::new("jrn_seq"))
+            .column(Alias::new("n"))
+            .query(cte_body);
+
+        let with_clause = WithClause::new().recursive(true).cte(cte).to_owned();
+        let main = Query::select()
+            .expr(Expr::col(Alias::new("n")))
+            .from(Alias::new("jrn_seq"))
+            .order_by(Alias::new("n"), Order::Asc)
+            .take();
+        let with_query = with_clause.query(main);
+
+        let rows = db
+            .query_all(&with_query)
+            .await
+            .expect("WITH RECURSIVE count query");
+
+        assert_eq!(rows.len(), 10, "recursive sequence must produce 10 rows");
+        // [T-journey 定档] CTE 锚点 `SELECT 1` 的列推断为 INT4，按 i32 解码
+        let ns: Vec<i32> = rows
+            .iter()
+            .map(|r| r.try_get_by_index::<i32>(0).expect("decode n as i32"))
+            .collect();
+        let expected: Vec<i32> = (1..=10).collect();
+        assert_eq!(ns, expected, "recursion must count 1..=10 in order");
+
+        Ok::<(), DbErr>(())
+    }
+    .await;
+
+    body.expect("cte_with_recursive_count body");
+}

@@ -120,6 +120,6 @@ with-uuid = ["sea-orm/with-uuid"]
 # so a standalone build of this crate cannot resolve that feature
 # against the crates.io sea-query.
 [patch.crates-io]
-sea-query = { path = "../../sea-query" }
-sea-query-sqlx = { path = "../../sea-query/sea-query-sqlx" }
+sea-query = { path = "../../sea-query-1.0.2" }
+sea-query-sqlx = { path = "../../sea-query-1.0.2/sea-query-sqlx" }
 sea-schema = { path = "../../sea-schema" }
