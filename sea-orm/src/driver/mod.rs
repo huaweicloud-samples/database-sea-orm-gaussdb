@@ -28,7 +28,7 @@ pub(crate) use sqlx_common::*;
 #[cfg(feature = "gaussdb")]
 pub use sqlx_gaussdb::*;
 #[cfg(feature = "gaussdb")]
-pub use sqlx_gaussdb_vector::FloatVector;
+pub use sqlx_gaussdb_vector::{BoolVector, FloatVector, GaussDBVectorQuery};
 #[cfg(feature = "sqlx-mysql")]
 pub use sqlx_mysql::*;
 #[cfg(feature = "sqlx-postgres")]

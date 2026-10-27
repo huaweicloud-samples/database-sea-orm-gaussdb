@@ -61,6 +61,7 @@ impl IndexBuilder for GaussDBQueryBuilder {
         self.prepare_index_type(&create.index_type, sql);
         sql.write_str(" ").unwrap();
         self.prepare_index_columns(&create.index.columns, sql);
+        self.prepare_index_with(&create.index_with, sql);
 
         if !create.include_columns.is_empty() {
             sql.write_str(" ").unwrap();
@@ -200,5 +201,128 @@ impl GaussDBQueryBuilder {
         );
 
         sql.write_str(")").unwrap();
+    }
+
+    /// Write the `WITH (key = value)` index storage parameters
+    /// ([`GaussDBIndexExt::gaussdb_index_with`](crate::extension::gaussdb::GaussDBIndexExt)),
+    /// e.g. `WITH (IVF_NLIST = 16)` for `USING GSIVFFLAT` vector indexes.
+    fn prepare_index_with(&self, options: &[(String, String)], sql: &mut impl SqlWriter) {
+        if options.is_empty() {
+            return;
+        }
+
+        sql.write_str(" WITH (").unwrap();
+
+        let mut options = options.iter();
+        if let Some((key, value)) = options.next() {
+            sql.write_str(key).unwrap();
+            sql.write_str(" = ").unwrap();
+            sql.write_str(value).unwrap();
+        }
+        for (key, value) in options {
+            sql.write_str(", ").unwrap();
+            sql.write_str(key).unwrap();
+            sql.write_str(" = ").unwrap();
+            sql.write_str(value).unwrap();
+        }
+
+        sql.write_str(")").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{extension::gaussdb::GaussDBIndexExt, tests_cfg::*, *};
+
+    // A 模式向量索引定档语法：
+    // `CREATE INDEX <名> ON <表> USING GSIVFFLAT (<列> <操作符>) WITH (IVF_NLIST = <n>)`
+    #[test]
+    fn test_gaussdb_index_create_gsivfflat_l2_with() {
+        assert_eq!(
+            Index::create()
+                .name("seaorm_vec_idx_t_r_idx")
+                .table("seaorm_vec_idx_t")
+                .col(IndexColumn::from(Alias::new("repr")).with_operator_class("L2"))
+                .gaussdb_index_method("GSIVFFLAT")
+                .gaussdb_index_with("IVF_NLIST", 16)
+                .to_owned()
+                .to_string(GaussDBQueryBuilder),
+            r#"CREATE INDEX "seaorm_vec_idx_t_r_idx" ON "seaorm_vec_idx_t" USING GSIVFFLAT ("repr" L2) WITH (IVF_NLIST = 16)"#
+        );
+    }
+
+    // 多个 WITH 参数累积渲染
+    #[test]
+    fn test_gaussdb_index_create_gsivfflat_multiple_with() {
+        assert_eq!(
+            Index::create()
+                .name("idx-emb")
+                .table("item")
+                .col(IndexColumn::from(Alias::new("embedding")).with_operator_class("IP"))
+                .gaussdb_index_method("GSIVFFLAT")
+                .gaussdb_index_with("IVF_NLIST", 256)
+                .gaussdb_index_with("IVF_NPROBE", 8)
+                .to_owned()
+                .to_string(GaussDBQueryBuilder),
+            r#"CREATE INDEX "idx-emb" ON "item" USING GSIVFFLAT ("embedding" IP) WITH (IVF_NLIST = 256, IVF_NPROBE = 8)"#
+        );
+    }
+
+    // GSDISKANN 无操作符形态（不加 operator class）
+    #[test]
+    fn test_gaussdb_index_create_gsdiskann_no_operator() {
+        assert_eq!(
+            Index::create()
+                .name("idx-emb")
+                .table("item")
+                .col(Alias::new("embedding"))
+                .gaussdb_index_method("GSDISKANN")
+                .to_owned()
+                .to_string(GaussDBQueryBuilder),
+            r#"CREATE INDEX "idx-emb" ON "item" USING GSDISKANN ("embedding")"#
+        );
+    }
+
+    // 普通 btree 索引不受影响（无 USING / 无 WITH）
+    #[test]
+    fn test_gaussdb_index_create_btree_unchanged() {
+        assert_eq!(
+            Index::create()
+                .name("idx-aspect")
+                .table(Glyph::Table)
+                .col(Glyph::Aspect)
+                .to_owned()
+                .to_string(GaussDBQueryBuilder),
+            r#"CREATE INDEX "idx-aspect" ON "glyph" ("aspect")"#
+        );
+
+        // 显式 BTREE 也保持原渲染
+        assert_eq!(
+            Index::create()
+                .name("idx-aspect")
+                .table(Glyph::Table)
+                .col(Glyph::Aspect)
+                .index_type(IndexType::BTree)
+                .to_owned()
+                .to_string(GaussDBQueryBuilder),
+            r#"CREATE INDEX "idx-aspect" ON "glyph" USING BTREE ("aspect")"#
+        );
+    }
+
+    // 仅 gaussdb backend 消费：其他 backend 忽略 WITH 参数（USING 部分为
+    // IndexType::Custom 的通用逃逸口，本来就渲染）
+    #[test]
+    fn test_gaussdb_index_with_ignored_by_other_backends() {
+        assert_eq!(
+            Index::create()
+                .name("idx-emb")
+                .table("item")
+                .col(IndexColumn::from(Alias::new("embedding")).with_operator_class("L2"))
+                .gaussdb_index_method("GSIVFFLAT")
+                .gaussdb_index_with("IVF_NLIST", 16)
+                .to_owned()
+                .to_string(PostgresQueryBuilder),
+            r#"CREATE INDEX "idx-emb" ON "item" USING GSIVFFLAT ("embedding" L2)"#
+        );
     }
 }

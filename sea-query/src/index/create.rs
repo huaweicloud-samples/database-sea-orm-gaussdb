@@ -214,6 +214,9 @@ pub struct IndexCreateStatement {
     pub(crate) concurrently: bool,
     pub(crate) nulls_not_distinct: bool,
     pub(crate) index_type: Option<IndexType>,
+    /// Index storage parameters, rendered as `WITH (key = value)` by
+    /// [`crate::GaussDBQueryBuilder`] only; all other backends ignore it.
+    pub(crate) index_with: Vec<(String, String)>,
     pub(crate) if_not_exists: bool,
     pub(crate) r#where: ConditionHolder,
     pub(crate) include_columns: Vec<DynIden>,
@@ -240,6 +243,7 @@ impl IndexCreateStatement {
             concurrently: false,
             nulls_not_distinct: false,
             index_type: None,
+            index_with: vec![],
             if_not_exists: false,
             r#where: ConditionHolder::new(),
             include_columns: vec![],
@@ -349,6 +353,7 @@ impl IndexCreateStatement {
             concurrently: self.concurrently,
             nulls_not_distinct: self.nulls_not_distinct,
             index_type: self.index_type.take(),
+            index_with: self.index_with.clone(),
             if_not_exists: self.if_not_exists,
             r#where: self.r#where.clone(),
             include_columns: self.include_columns.clone(),

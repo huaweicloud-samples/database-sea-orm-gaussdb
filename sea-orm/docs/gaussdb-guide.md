@@ -168,12 +168,72 @@ let nearest = db.query_one_raw(Statement::from_sql_and_values(
 // SELECT l2_distance(repr, $1::floatvector)::float8 AS d FROM vt ...
 ```
 
-接入 `DeriveEntityModel` 的业务侧最小路径（本期不内置向量列一等支持）：
+### 6.1 便捷距离查询（GaussDBVectorQuery 扩展 trait）
+
+`cfg(feature = "gaussdb")` 下，`sea_orm::GaussDBVectorQuery` 为所有查询构造器
+（`Entity::find()` 等，及裸 `SelectStatement`）提供三个方法，内部生成
+「文本形态参数 + `$n::floatvector` 显式 cast」的绑定形态（与既有参数自动重编号共存）：
 
 ```rust
-#[derive(Clone, Debug, PartialEq, sea_orm::DeriveValueType)]
-pub struct Repr(pub FloatVector);
+use sea_orm::{FloatVector, GaussDBVectorQuery};
+
+let q = FloatVector(vec![1.0, 2.0, 3.0]);
+
+// ANN：ORDER BY repr <-> $1::floatvector（L2 距离升序，最近在前）
+cake::Entity::find()
+    .order_by_l2_distance(cake::COLUMN.repr, q.clone())
+    .limit(10)
+    .all(&db).await?;
+
+// ORDER BY cosine_distance(repr, $1::floatvector)（函数形态，越小越相似）
+cake::Entity::find()
+    .order_by_cosine_distance(cake::COLUMN.repr, q.clone())
+    .limit(10)
+    .all(&db).await?;
+
+// 半径过滤：WHERE l2_distance(repr, $1::floatvector) <= $2（radius 绑定 float8）
+cake::Entity::find()
+    .filter_l2_distance_within(cake::COLUMN.repr, q, 0.5)
+    .all(&db).await?;
 ```
+
+### 6.2 一等实体字段（DeriveValueType 包装）
+
+向量列可以直接作为实体字段：包装类型经 `DeriveValueType` 全量委托内层
+`FloatVector` 的绑定/读取通道，**实体字段必须加 `save_as = "floatvector"`**——
+INSERT/UPDATE 会渲染 `CAST($n AS floatvector)`（等价 `$n::floatvector` 定档形态；
+缺省时值以 TEXT 声明参数直插，被服务端拒绝）：
+
+```rust
+use sea_orm::{entity::prelude::*, FloatVector};
+
+#[derive(Clone, Debug, PartialEq, DeriveValueType)]
+#[sea_orm(column_type = r#"custom("floatvector")"#)]
+pub struct Embedding(pub FloatVector);
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "seaorm_vec_dv_t")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: i32,
+    #[sea_orm(save_as = "floatvector")]   // 写侧 cast，必填
+    pub emb: Embedding,
+}
+
+let m = dv_vec::ActiveModel {
+    id: Set(1),
+    emb: Set(Embedding(FloatVector(vec![1.5, -2.5, 3.25]))),
+}
+.insert(&db).await?;            // INSERT ... VALUES ($1, CAST($2 AS floatvector))
+
+let back = dv_vec::Entity::find()
+    .filter(dv_vec::Column::Id.eq(1))
+    .one(&db).await?;           // 读侧无 cast，floatvector 列原生解码
+```
+
+说明：`column_type = custom("floatvector")` 落在包装类型上，供列类型推断与
+schema 生成；读取走 floatvector 列原生解码（无 `select_as`，勿加
+`select_as = "text"`——会把列读成 text，破坏 `FloatVector` 解码）。
 
 GSIVFFLAT 索引（适用 1 万~200 万行；更大规模用 GsDiskANN）：
 
@@ -183,8 +243,10 @@ CREATE INDEX vt_repr_idx ON vt USING GSIVFFLAT (repr L2) WITH (IVF_NLIST = 16);
 -- 运维：gs_ivfflat_inspect('vt_repr_idx')；数据变更 >20% 或 truncate 后建议重建
 ```
 
-约束：元素不支持 NaN/Inf/NULL（22000）；**boolvector 列内核级拒 NULL**（0A000），本期未实现
-boolvector 类型通道；floatvector 列整列可为 NULL。
+约束：元素不支持 NaN/Inf/NULL（22000）；**boolvector 列内核级拒 NULL**（0A000），
+INSERT 必须带值；`BoolVector` 类型通道（OID 4410）已提供，绑定同方案 b
+（`$n::boolvector` cast），wire 二进制格式未定档（解码按候选布局尝试，真库
+round-trip 定档）；floatvector 列整列可为 NULL。
 
 ## 7. 能力门说明（LATERAL / FILTER）
 

@@ -1,5 +1,9 @@
 //! Engine specific SQL features.
 
+#[cfg(feature = "backend-gaussdb")]
+#[cfg_attr(docsrs, doc(cfg(feature = "backend-gaussdb")))]
+pub mod gaussdb;
+
 #[cfg(feature = "backend-mysql")]
 #[cfg_attr(docsrs, doc(cfg(feature = "backend-mysql")))]
 pub mod mysql;
